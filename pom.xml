@@ -22,6 +22,7 @@
 
   <modules>
     <module>vexil-core</module>
+    <module>vexil-wire</module>
     <module>vexil-server</module>
   </modules>
 

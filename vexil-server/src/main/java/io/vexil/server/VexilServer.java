@@ -3,10 +3,12 @@ package io.vexil.server;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import io.vexil.core.model.Experiment;
+import io.vexil.core.model.ConfigSnapshot;
 import io.vexil.core.spi.ConfigSource;
 import io.vexil.core.spi.EventSink;
 import io.vexil.core.spi.ExposureEvent;
+import io.vexil.wire.ConfigSnapshotDto;
+import io.vexil.wire.VexilJson;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -23,9 +25,9 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>Endpoints:
  * <ul>
- *   <li>{@code GET /api/experiments} — current experiment set as JSON</li>
- *   <li>{@code GET /api/stream} — Server-Sent Events; pushes the full experiment set on connect
- *       and again on every config change, so SDKs pick up changes in near real time</li>
+ *   <li>{@code GET /api/experiments} — current config snapshot (experiments + holdouts) as JSON</li>
+ *   <li>{@code GET /api/stream} — Server-Sent Events; pushes the full snapshot on connect and
+ *       again on every config change, so SDKs pick up changes in near real time</li>
  *   <li>{@code POST /api/events} — accepts a JSON array of exposure events from SDKs and
  *       forwards them to the configured {@link EventSink}s</li>
  * </ul>
@@ -37,15 +39,15 @@ import java.util.concurrent.TimeUnit;
 public final class VexilServer implements AutoCloseable {
 
     private final HttpServer httpServer;
-    private final ObjectMapper mapper = new ObjectMapper();
+    private final ObjectMapper mapper = VexilJson.mapper();
     private final List<EventSink> sinks;
     private final List<SynchronousQueue<String>> streamClients = new CopyOnWriteArrayList<>();
-    private volatile List<Experiment> experiments;
+    private volatile ConfigSnapshot snapshot;
 
     public VexilServer(int port, ConfigSource configSource, List<EventSink> sinks) throws IOException {
         this.sinks = List.copyOf(sinks);
-        this.experiments = configSource.load().experiments();
-        configSource.watch(snapshot -> onConfigChanged(snapshot.experiments()));
+        this.snapshot = configSource.load();
+        configSource.watch(this::onConfigChanged);
 
         this.httpServer = HttpServer.create(new InetSocketAddress(port), 0);
         httpServer.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
@@ -62,11 +64,11 @@ public final class VexilServer implements AutoCloseable {
         return httpServer.getAddress().getPort();
     }
 
-    private void onConfigChanged(List<Experiment> updated) {
-        this.experiments = updated;
+    private void onConfigChanged(ConfigSnapshot updated) {
+        this.snapshot = updated;
         String payload;
         try {
-            payload = mapper.writeValueAsString(ExperimentDto.from(updated));
+            payload = mapper.writeValueAsString(ConfigSnapshotDto.from(updated));
         } catch (IOException e) {
             return;
         }
@@ -80,7 +82,7 @@ public final class VexilServer implements AutoCloseable {
             exchange.sendResponseHeaders(405, -1);
             return;
         }
-        byte[] body = mapper.writeValueAsBytes(ExperimentDto.from(experiments));
+        byte[] body = mapper.writeValueAsBytes(ConfigSnapshotDto.from(snapshot));
         exchange.getResponseHeaders().set("Content-Type", "application/json");
         exchange.sendResponseHeaders(200, body.length);
         try (OutputStream out = exchange.getResponseBody()) {
@@ -100,7 +102,7 @@ public final class VexilServer implements AutoCloseable {
         SynchronousQueue<String> updates = new SynchronousQueue<>();
         streamClients.add(updates);
         try (OutputStream out = exchange.getResponseBody()) {
-            writeSseEvent(out, mapper.writeValueAsString(ExperimentDto.from(experiments)));
+            writeSseEvent(out, mapper.writeValueAsString(ConfigSnapshotDto.from(snapshot)));
             while (!Thread.currentThread().isInterrupted()) {
                 String next = updates.poll(15, TimeUnit.SECONDS);
                 if (next == null) {
