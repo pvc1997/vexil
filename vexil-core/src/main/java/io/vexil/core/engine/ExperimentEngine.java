@@ -3,8 +3,10 @@ package io.vexil.core.engine;
 import io.vexil.core.Assignment;
 import io.vexil.core.EvaluationContext;
 import io.vexil.core.hash.Bucketer;
+import io.vexil.core.model.ConfigSnapshot;
 import io.vexil.core.model.Experiment;
 import io.vexil.core.model.ExperimentStatus;
+import io.vexil.core.model.Holdout;
 import io.vexil.core.model.Variant;
 import io.vexil.core.spi.ConfigSource;
 import io.vexil.core.spi.EventSink;
@@ -20,9 +22,12 @@ import java.util.Objects;
 /**
  * The assignment engine: evaluates experiments for units, deterministically and without I/O.
  *
- * <p>Evaluation is pure CPU (a Murmur3 hash and a table walk) and safe to call on any hot path.
- * Exposure events are handed to sinks asynchronously on a virtual thread; config updates from a
- * watching {@link ConfigSource} are applied atomically via a volatile snapshot swap.
+ * <p>Evaluation is pure CPU (a few Murmur3 hashes and a table walk) and safe to call on any hot
+ * path. Exposure events are handed to sinks asynchronously on a virtual thread; config updates
+ * from a watching {@link ConfigSource} are applied atomically via a volatile snapshot swap.
+ *
+ * <p>Evaluation order: experiment exists → running → not in a global holdout → targeting rules
+ * match → inside the experiment's layer slice → inside traffic allocation → variant pick.
  */
 public final class ExperimentEngine implements AutoCloseable {
 
@@ -31,7 +36,17 @@ public final class ExperimentEngine implements AutoCloseable {
     private final ConfigSource configSource;
     private final ExposureDispatcher dispatcher;
     private final Clock clock;
-    private volatile Map<String, Experiment> experiments;
+    private volatile State state;
+
+    private record State(Map<String, Experiment> experiments, List<Holdout> holdouts) {
+        static State from(ConfigSnapshot snapshot) {
+            Map<String, Experiment> byKey = new HashMap<>();
+            for (Experiment experiment : snapshot.experiments()) {
+                byKey.put(experiment.key(), experiment);
+            }
+            return new State(Map.copyOf(byKey), snapshot.holdouts());
+        }
+    }
 
     public ExperimentEngine(ConfigSource configSource, List<EventSink> sinks) {
         this(configSource, sinks, Clock.systemUTC());
@@ -41,8 +56,8 @@ public final class ExperimentEngine implements AutoCloseable {
         this.configSource = Objects.requireNonNull(configSource, "configSource");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.dispatcher = new ExposureDispatcher(sinks, DEFAULT_QUEUE_CAPACITY);
-        this.experiments = index(configSource.load());
-        configSource.watch(updated -> this.experiments = index(updated));
+        this.state = State.from(configSource.load());
+        configSource.watch(updated -> this.state = State.from(updated));
     }
 
     /**
@@ -60,16 +75,29 @@ public final class ExperimentEngine implements AutoCloseable {
 
     /** Evaluates without recording an exposure — for lookups that don't imply the user saw anything. */
     public Assignment evaluateSilently(String experimentKey, EvaluationContext context) {
-        Experiment experiment = experiments.get(experimentKey);
+        State current = state;
+        Experiment experiment = current.experiments().get(experimentKey);
         if (experiment == null) {
             return Assignment.excluded(experimentKey, Assignment.Reason.EXPERIMENT_NOT_FOUND);
         }
         if (experiment.status() != ExperimentStatus.RUNNING) {
             return Assignment.excluded(experimentKey, Assignment.Reason.NOT_RUNNING);
         }
+        for (Holdout holdout : current.holdouts()) {
+            if (Bucketer.bucket(holdout.salt() + ":holdout", context.unitId()) < holdout.fraction()) {
+                return Assignment.excluded(experimentKey, Assignment.Reason.IN_HOLDOUT);
+            }
+        }
         for (TargetingRule rule : experiment.targetingRules()) {
             if (!rule.matches(context)) {
                 return Assignment.excluded(experimentKey, Assignment.Reason.NOT_TARGETED);
+            }
+        }
+
+        if (experiment.layerKey() != null) {
+            double layerPoint = Bucketer.bucket("layer:" + experiment.layerKey(), context.unitId());
+            if (layerPoint < experiment.layerRangeStart() || layerPoint >= experiment.layerRangeEnd()) {
+                return Assignment.excluded(experimentKey, Assignment.Reason.NOT_IN_LAYER);
             }
         }
 
@@ -101,14 +129,6 @@ public final class ExperimentEngine implements AutoCloseable {
             }
         }
         return variants.getLast(); // guards floating-point edge where cumulative sums to <1.0
-    }
-
-    private static Map<String, Experiment> index(List<Experiment> list) {
-        Map<String, Experiment> byKey = new HashMap<>();
-        for (Experiment experiment : list) {
-            byKey.put(experiment.key(), experiment);
-        }
-        return Map.copyOf(byKey);
     }
 
     @Override

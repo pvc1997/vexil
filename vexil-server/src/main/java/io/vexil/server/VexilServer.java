@@ -44,8 +44,8 @@ public final class VexilServer implements AutoCloseable {
 
     public VexilServer(int port, ConfigSource configSource, List<EventSink> sinks) throws IOException {
         this.sinks = List.copyOf(sinks);
-        this.experiments = configSource.load();
-        configSource.watch(this::onConfigChanged);
+        this.experiments = configSource.load().experiments();
+        configSource.watch(snapshot -> onConfigChanged(snapshot.experiments()));
 
         this.httpServer = HttpServer.create(new InetSocketAddress(port), 0);
         httpServer.setExecutor(Executors.newVirtualThreadPerTaskExecutor());

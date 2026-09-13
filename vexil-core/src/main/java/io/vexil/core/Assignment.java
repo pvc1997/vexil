@@ -22,7 +22,11 @@ public record Assignment(String experimentKey, String variantKey, Reason reason,
         /** The unit's attributes did not satisfy the targeting rules. */
         NOT_TARGETED,
         /** Eligible, but outside the experiment's traffic allocation. */
-        NOT_IN_TRAFFIC
+        NOT_IN_TRAFFIC,
+        /** The unit belongs to a global holdout group and is withheld from all experiments. */
+        IN_HOLDOUT,
+        /** The unit's point in the experiment's layer falls outside this experiment's slice. */
+        NOT_IN_LAYER
     }
 
     public boolean enrolled() {

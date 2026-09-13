@@ -1,5 +1,6 @@
 package io.vexil.core.source;
 
+import io.vexil.core.model.ConfigSnapshot;
 import io.vexil.core.model.Experiment;
 import io.vexil.core.spi.ConfigSource;
 
@@ -13,28 +14,37 @@ import java.util.function.Consumer;
  */
 public final class InMemoryConfigSource implements ConfigSource {
 
-    private volatile List<Experiment> experiments;
-    private final List<Consumer<List<Experiment>>> listeners = new CopyOnWriteArrayList<>();
+    private volatile ConfigSnapshot snapshot;
+    private final List<Consumer<ConfigSnapshot>> listeners = new CopyOnWriteArrayList<>();
+
+    public InMemoryConfigSource(ConfigSnapshot snapshot) {
+        this.snapshot = snapshot;
+    }
 
     public InMemoryConfigSource(List<Experiment> experiments) {
-        this.experiments = List.copyOf(experiments);
+        this(ConfigSnapshot.of(experiments));
     }
 
     @Override
-    public List<Experiment> load() {
-        return experiments;
+    public ConfigSnapshot load() {
+        return snapshot;
     }
 
     @Override
-    public void watch(Consumer<List<Experiment>> listener) {
+    public void watch(Consumer<ConfigSnapshot> listener) {
         listeners.add(listener);
     }
 
-    /** Replaces the experiment set and notifies all watchers. */
-    public void update(List<Experiment> updated) {
-        this.experiments = List.copyOf(updated);
-        for (Consumer<List<Experiment>> listener : listeners) {
-            listener.accept(this.experiments);
+    /** Replaces the configuration and notifies all watchers. */
+    public void update(ConfigSnapshot updated) {
+        this.snapshot = updated;
+        for (Consumer<ConfigSnapshot> listener : listeners) {
+            listener.accept(updated);
         }
+    }
+
+    /** Replaces the experiment set (keeping no holdouts) and notifies all watchers. */
+    public void update(List<Experiment> experiments) {
+        update(ConfigSnapshot.of(experiments));
     }
 }
