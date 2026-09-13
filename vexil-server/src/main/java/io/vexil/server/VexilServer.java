@@ -26,6 +26,9 @@ import java.util.concurrent.TimeUnit;
  * <p>Endpoints:
  * <ul>
  *   <li>{@code GET /api/experiments} — current config snapshot (experiments + holdouts) as JSON</li>
+ *   <li>{@code PUT /api/experiments/{key}} — create or replace an experiment (admin; requires a
+ *       {@link ConfigStore}-backed source and, when configured, a bearer token)</li>
+ *   <li>{@code DELETE /api/experiments/{key}} — delete an experiment (admin, same requirements)</li>
  *   <li>{@code GET /api/stream} — Server-Sent Events; pushes the full snapshot on connect and
  *       again on every config change, so SDKs pick up changes in near real time</li>
  *   <li>{@code POST /api/events} — accepts a JSON array of exposure events from SDKs and
@@ -42,10 +45,23 @@ public final class VexilServer implements AutoCloseable {
     private final ObjectMapper mapper = VexilJson.mapper();
     private final List<EventSink> sinks;
     private final List<SynchronousQueue<String>> streamClients = new CopyOnWriteArrayList<>();
+    private final ConfigStore store; // null when the config source is read-only
+    private final String adminToken; // null disables auth
     private volatile ConfigSnapshot snapshot;
 
     public VexilServer(int port, ConfigSource configSource, List<EventSink> sinks) throws IOException {
+        this(port, configSource, sinks, null);
+    }
+
+    /**
+     * @param adminToken when non-null, mutating admin requests must carry
+     *                   {@code Authorization: Bearer <adminToken>}
+     */
+    public VexilServer(int port, ConfigSource configSource, List<EventSink> sinks, String adminToken)
+            throws IOException {
         this.sinks = List.copyOf(sinks);
+        this.store = configSource instanceof ConfigStore mutable ? mutable : null;
+        this.adminToken = adminToken;
         this.snapshot = configSource.load();
         configSource.watch(this::onConfigChanged);
 
@@ -78,16 +94,69 @@ public final class VexilServer implements AutoCloseable {
     }
 
     private void handleExperiments(HttpExchange exchange) throws IOException {
-        if (!"GET".equals(exchange.getRequestMethod())) {
-            exchange.sendResponseHeaders(405, -1);
+        String path = exchange.getRequestURI().getPath();
+        String key = path.length() > "/api/experiments/".length()
+                ? path.substring("/api/experiments/".length())
+                : null;
+        switch (exchange.getRequestMethod()) {
+            case "GET" -> {
+                byte[] body = mapper.writeValueAsBytes(ConfigSnapshotDto.from(snapshot));
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, body.length);
+                try (OutputStream out = exchange.getResponseBody()) {
+                    out.write(body);
+                }
+            }
+            case "PUT" -> handleAdminPut(exchange, key);
+            case "DELETE" -> handleAdminDelete(exchange, key);
+            default -> exchange.sendResponseHeaders(405, -1);
+        }
+    }
+
+    /** Returns true when the request may mutate config; otherwise responds and returns false. */
+    private boolean authorizeAdmin(HttpExchange exchange, String key) throws IOException {
+        if (key == null || key.isBlank()) {
+            exchange.sendResponseHeaders(400, -1);
+            return false;
+        }
+        if (store == null) {
+            exchange.sendResponseHeaders(403, -1); // read-only config source
+            return false;
+        }
+        if (adminToken != null) {
+            String header = exchange.getRequestHeaders().getFirst("Authorization");
+            if (!("Bearer " + adminToken).equals(header)) {
+                exchange.sendResponseHeaders(401, -1);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void handleAdminPut(HttpExchange exchange, String key) throws IOException {
+        if (!authorizeAdmin(exchange, key)) {
             return;
         }
-        byte[] body = mapper.writeValueAsBytes(ConfigSnapshotDto.from(snapshot));
-        exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(200, body.length);
-        try (OutputStream out = exchange.getResponseBody()) {
-            out.write(body);
+        try {
+            var experiment = mapper
+                    .readValue(exchange.getRequestBody(), ConfigSnapshotDto.ExperimentDto.class)
+                    .toExperiment();
+            if (!experiment.key().equals(key)) {
+                exchange.sendResponseHeaders(400, -1);
+                return;
+            }
+            store.putExperiment(experiment);
+            exchange.sendResponseHeaders(204, -1);
+        } catch (IllegalArgumentException | com.fasterxml.jackson.core.JacksonException e) {
+            exchange.sendResponseHeaders(400, -1);
         }
+    }
+
+    private void handleAdminDelete(HttpExchange exchange, String key) throws IOException {
+        if (!authorizeAdmin(exchange, key)) {
+            return;
+        }
+        exchange.sendResponseHeaders(store.deleteExperiment(key) ? 204 : 404, -1);
     }
 
     private void handleStream(HttpExchange exchange) throws IOException {
