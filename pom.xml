@@ -25,6 +25,8 @@
     <module>vexil-wire</module>
     <module>vexil-server</module>
     <module>vexil-client</module>
+    <module>vexil-sink-jdbc</module>
+    <module>vexil-sink-kafka</module>
   </modules>
 
   <properties>
